@@ -1,19 +1,15 @@
-# Railway / Nixpacks конфиг
-# Устанавливает системные библиотеки нужные для пакета canvas (рисование карточки питомца)
-
-[phases.setup]
-nixPkgs = [
-  "cairo",
-  "pango",
-  "libjpeg",
-  "giflib",
-  "librsvg",
-  "pkg-config",
-  "pixman",
-]
-
-[phases.install]
-cmds = ["npm install"]
-
-[start]
-cmd = "npm start"
+{
+  "name": "server-tamagotchi",
+  "version": "1.0.0",
+  "description": "Тамагочи для Discord-сервера",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "better-sqlite3": "^9.4.3",
+    "canvas": "^2.11.2",
+    "dotenv": "^16.4.1"
+  }
+}
