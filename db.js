@@ -1,7 +1,10 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'tamagotchi.db'));
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'tamagotchi.db');
+const dbDir = require('path').dirname(dbPath);
+if (!require('fs').existsSync(dbDir)) require('fs').mkdirSync(dbDir, { recursive: true });
+const db = new Database(dbPath);
 
 function init() {
   db.exec(`
