@@ -1,0 +1,16 @@
+{
+  "name": "server-tamagotchi",
+  "version": "1.0.0",
+  "description": "Тамагочи для Discord-сервера — общий котик за которым ухаживает весь сервер",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "better-sqlite3": "^9.4.3",
+    "canvas": "^2.11.2",
+    "dotenv": "^16.4.1"
+  }
+}

@@ -1,0 +1,19 @@
+# Railway / Nixpacks конфиг
+# Устанавливает системные библиотеки нужные для пакета canvas (рисование карточки питомца)
+
+[phases.setup]
+nixPkgs = [
+  "cairo",
+  "pango",
+  "libjpeg",
+  "giflib",
+  "librsvg",
+  "pkg-config",
+  "pixman",
+]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "npm start"
