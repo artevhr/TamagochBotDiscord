@@ -1,252 +1,181 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const db = require('./db');
 
-const db = new Database(path.join(__dirname, 'tamagotchi.db'));
+// Насколько быстро меняются параметры (за один тик = 5 мин)
+const HUNGER_DRAIN   = 3;   // -сытость/тик
+const HAPPY_DRAIN    = 2;   // -настроение/тик
+const HEALTH_REGEN   = 2;   // +здоровье/тик если сытость > 50
+const HEALTH_DRAIN   = 5;   // -здоровье/тик если сытость < 20
+const TICK_MS        = 5 * 60 * 1000; // 5 минут
+const XP_PER_TICK    = 1;   // пассивный XP за выживание
 
-function init() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS pets (
-      guild_id   TEXT    PRIMARY KEY,
-      name       TEXT    NOT NULL DEFAULT 'Мурзик',
-      hunger     INTEGER NOT NULL DEFAULT 80,
-      happiness  INTEGER NOT NULL DEFAULT 80,
-      health     INTEGER NOT NULL DEFAULT 100,
-      age_ticks  INTEGER NOT NULL DEFAULT 0,
-      level      INTEGER NOT NULL DEFAULT 1,
-      xp         INTEGER NOT NULL DEFAULT 0,
-      is_dead    INTEGER NOT NULL DEFAULT 0,
-      last_tick  INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
-      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
-    );
+// Кулдауны в миллисекундах
+const COOLDOWNS = {
+  feed:   15 * 60 * 1000,  // 15 мин
+  pet:    10 * 60 * 1000,  // 10 мин
+  play:   20 * 60 * 1000,  // 20 мин
+  work:   60 * 60 * 1000,  // 1 час (работа)
+  daily: 24 * 60 * 60 * 1000, // 24 ч (ежедневная награда)
+};
 
-    CREATE TABLE IF NOT EXISTS feeders (
-      guild_id   TEXT    NOT NULL,
-      user_id    TEXT    NOT NULL,
-      username   TEXT    NOT NULL,
-      feed_count INTEGER NOT NULL DEFAULT 0,
-      pet_count  INTEGER NOT NULL DEFAULT 0,
-      play_count INTEGER NOT NULL DEFAULT 0,
-      last_action INTEGER,
-      PRIMARY KEY (guild_id, user_id)
-    );
+// Цены и награды
+const PRICES = {
+  feed:   50,    // стоимость покормить
+  pet:    20,    // стоимость погладить
+  play:   30,    // стоимость поиграть
+  revive: 1000,  // стоимость возродить
+};
 
-    CREATE TABLE IF NOT EXISTS cooldowns (
-      guild_id TEXT NOT NULL,
-      user_id  TEXT NOT NULL,
-      action   TEXT NOT NULL,
-      last_used INTEGER NOT NULL,
-      PRIMARY KEY (guild_id, user_id, action)
-    );
+const REWARDS = {
+  feed_xp:   3,   // XP за кормёжку
+  play_xp:   5,   // XP за игру
+  work_min:  80,  // мин монет с работы
+  work_max:  200, // макс монет с работы
+  daily:     150, // ежедневный бонус
+};
 
-    CREATE TABLE IF NOT EXISTS wallets (
-      guild_id   TEXT    NOT NULL,
-      user_id    TEXT    NOT NULL,
-      username   TEXT    NOT NULL,
-      coins      INTEGER NOT NULL DEFAULT 0,
-      total_earned INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guild_id, user_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id   TEXT    NOT NULL,
-      from_id    TEXT,
-      to_id      TEXT    NOT NULL,
-      amount     INTEGER NOT NULL,
-      reason     TEXT    NOT NULL,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
-    );
-  `);
-
-  console.log('✅ База данных инициализирована');
+/**
+ * Определяет настроение питомца по его статам
+ */
+function getMood(pet) {
+  if (pet.is_dead)          return 'dead';
+  if (pet.hunger   < 15)    return 'hungry';
+  if (pet.health   < 30)    return 'sick';
+  if (pet.happiness > 75)   return 'happy';
+  if (pet.happiness < 25)   return 'sad';
+  return 'neutral';
 }
 
-function getPet(guildId) {
-  return db.prepare('SELECT * FROM pets WHERE guild_id = ?').get(guildId);
+const MOOD_TEXTS = {
+  dead:    '† мёртв †',
+  hungry:  'очень голоден!',
+  sick:    'чувствует себя плохо...',
+  happy:   'в восторге!',
+  sad:     'грустит...',
+  neutral: 'всё нормально',
+};
+
+function getMoodText(mood) {
+  return MOOD_TEXTS[mood] || 'нормально';
 }
 
-function createPet(guildId, name = 'Мурзик') {
+/**
+ * Проверяет кулдаун. Возвращает 0 если готово, или секунды до конца.
+ */
+function checkCooldown(lastUsed, cooldownMs) {
+  if (!lastUsed) return 0;
+  const elapsed = Date.now() - lastUsed;
+  if (elapsed >= cooldownMs) return 0;
+  return Math.ceil((cooldownMs - elapsed) / 1000);
+}
+
+/**
+ * Форматирует секунды в "X мин Y сек" или просто "X мин"
+ */
+function formatCooldown(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m > 0 && s > 0) return `${m} мин ${s} сек`;
+  if (m > 0) return `${m} мин`;
+  return `${s} сек`;
+}
+
+/**
+ * Глобальный тик — обновляет всех живых питомцев
+ */
+function tickAllPets() {
+  const pets = db.getAllAlivePets();
   const now = Date.now();
-  db.prepare(`
-    INSERT OR REPLACE INTO pets
-      (guild_id, name, hunger, happiness, health, age_ticks, level, xp, is_dead, last_tick, created_at)
-    VALUES (?, ?, 80, 80, 100, 0, 1, 0, 0, ?, ?)
-  `).run(guildId, name, now, now);
-  return getPet(guildId);
-}
 
-function updatePet(guildId, fields) {
-  const keys = Object.keys(fields);
-  if (keys.length === 0) return;
-  const setClause = keys.map(k => `${k} = ?`).join(', ');
-  const values = keys.map(k => fields[k]);
-  db.prepare(`UPDATE pets SET ${setClause} WHERE guild_id = ?`).run(...values, guildId);
-}
+  for (const pet of pets) {
+    const elapsed = now - pet.last_tick;
+    const ticks = Math.floor(elapsed / TICK_MS);
+    if (ticks < 1) continue;
 
-function getAllAlivePets() {
-  return db.prepare('SELECT * FROM pets WHERE is_dead = 0').all();
-}
+    let { hunger, happiness, health, age_ticks, xp, level } = pet;
 
-function recordAction(guildId, userId, username, action) {
-  const existing = db.prepare('SELECT * FROM feeders WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
-  if (!existing) {
-    db.prepare(`
-      INSERT INTO feeders (guild_id, user_id, username, feed_count, pet_count, play_count, last_action)
-      VALUES (?, ?, ?, 0, 0, 0, ?)
-    `).run(guildId, userId, username, Date.now());
-  } else {
-    db.prepare('UPDATE feeders SET username = ?, last_action = ? WHERE guild_id = ? AND user_id = ?')
-      .run(username, Date.now(), guildId, userId);
-  }
+    for (let i = 0; i < ticks; i++) {
+      hunger     = Math.max(0, hunger     - HUNGER_DRAIN);
+      happiness  = Math.max(0, happiness  - HAPPY_DRAIN);
+      age_ticks += 1;
+      xp        += XP_PER_TICK;
 
-  const col = action === 'feed' ? 'feed_count' : action === 'pet' ? 'pet_count' : 'play_count';
-  db.prepare(`UPDATE feeders SET ${col} = ${col} + 1 WHERE guild_id = ? AND user_id = ?`).run(guildId, userId);
-}
+      if (hunger < 20) {
+        health = Math.max(0, health - HEALTH_DRAIN);
+      } else if (hunger > 50) {
+        health = Math.min(100, health + HEALTH_REGEN);
+      }
+    }
 
-function getTopFeeders(guildId, limit = 3) {
-  return db.prepare(`
-    SELECT username, feed_count, pet_count, play_count,
-           (feed_count * 3 + pet_count + play_count * 2) AS score
-    FROM feeders
-    WHERE guild_id = ?
-    ORDER BY score DESC
-    LIMIT ?
-  `).all(guildId, limit);
-}
+    // Проверка левелапа (каждые 100 XP)
+    const xpPerLevel = 100;
+    while (xp >= xpPerLevel) {
+      xp -= xpPerLevel;
+      level += 1;
+    }
 
-function getCooldown(guildId, userId, action) {
-  return db.prepare(
-    'SELECT last_used FROM cooldowns WHERE guild_id = ? AND user_id = ? AND action = ?'
-  ).get(guildId, userId, action);
-}
+    const is_dead = health <= 0 ? 1 : 0;
 
-function setCooldown(guildId, userId, action) {
-  db.prepare(`
-    INSERT OR REPLACE INTO cooldowns (guild_id, user_id, action, last_used)
-    VALUES (?, ?, ?, ?)
-  `).run(guildId, userId, action, Date.now());
-}
+    db.updatePet(pet.guild_id, {
+      hunger,
+      happiness,
+      health,
+      age_ticks,
+      xp,
+      level,
+      is_dead,
+      last_tick: now,
+    });
 
-// ─── Кошельки ────────────────────────────────────────────────────────────────
-
-function ensureWallet(guildId, userId, username) {
-  const exists = db.prepare('SELECT 1 FROM wallets WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
-  if (!exists) {
-    db.prepare(`
-      INSERT INTO wallets (guild_id, user_id, username, coins, total_earned)
-      VALUES (?, ?, ?, 0, 0)
-    `).run(guildId, userId, username);
-  } else {
-    db.prepare('UPDATE wallets SET username = ? WHERE guild_id = ? AND user_id = ?').run(username, guildId, userId);
+    if (is_dead) {
+      console.log(`💀 Питомец "${pet.name}" на сервере ${pet.guild_id} умер`);
+    }
   }
 }
 
-function getWallet(guildId, userId) {
-  return db.prepare('SELECT * FROM wallets WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
-}
+/**
+ * Переводит age_ticks в читаемый возраст
+ * 1 тик = 5 мин → 288 тиков = 1 день
+ */
+function formatAge(ageTicks) {
+  const totalMinutes = ageTicks * 5;
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
 
-function getCoins(guildId, userId) {
-  const w = getWallet(guildId, userId);
-  return w ? w.coins : 0;
+  if (days > 0) return `${days} д. ${hours} ч.`;
+  if (hours > 0) return `${hours} ч.`;
+  return `${totalMinutes} мин.`;
 }
 
 /**
- * Начислить монеты. reason — строка для истории транзакций.
+ * XP до следующего уровня
  */
-function addCoins(guildId, userId, username, amount, reason = 'reward') {
-  ensureWallet(guildId, userId, username);
-  db.prepare(`
-    UPDATE wallets SET coins = coins + ?, total_earned = total_earned + ?
-    WHERE guild_id = ? AND user_id = ?
-  `).run(amount, Math.max(0, amount), guildId, userId);
-  db.prepare(`
-    INSERT INTO transactions (guild_id, from_id, to_id, amount, reason)
-    VALUES (?, NULL, ?, ?, ?)
-  `).run(guildId, userId, amount, reason);
+function xpToNext(pet) {
+  return 100 - pet.xp;
 }
 
-/**
- * Списать монеты. Возвращает true если успешно, false если не хватает.
- */
-function spendCoins(guildId, userId, username, amount, reason = 'spend') {
-  ensureWallet(guildId, userId, username);
-  const wallet = getWallet(guildId, userId);
-  if (!wallet || wallet.coins < amount) return false;
-  db.prepare(`
-    UPDATE wallets SET coins = coins - ? WHERE guild_id = ? AND user_id = ?
-  `).run(amount, guildId, userId);
-  db.prepare(`
-    INSERT INTO transactions (guild_id, from_id, to_id, amount, reason)
-    VALUES (?, ?, NULL, ?, ?)
-  `).run(guildId, userId, amount, reason);
-  return true;
-}
+// Рандомные имена для нового котика
+const CAT_NAMES = [
+  'Мурзик', 'Барсик', 'Васька', 'Тигра', 'Пушок',
+  'Снежок', 'Рыжик', 'Бублик', 'Котофей', 'Кузьма',
+  'Персик', 'Шурик', 'Мотя', 'Феликс', 'Батон',
+  'Нарцисс', 'Пончик', 'Хомяк', 'Маршал', 'Кефир',
+];
 
-/**
- * Перевод монет между пользователями. Атомарная транзакция.
- * Возвращает { ok, reason }
- */
-function transferCoins(guildId, fromId, fromName, toId, toName, amount) {
-  ensureWallet(guildId, fromId, fromName);
-  ensureWallet(guildId, toId, toName);
-  const from = getWallet(guildId, fromId);
-  if (!from || from.coins < amount) return { ok: false, reason: 'not_enough' };
-  if (fromId === toId) return { ok: false, reason: 'self' };
-
-  const transfer = db.transaction(() => {
-    db.prepare('UPDATE wallets SET coins = coins - ? WHERE guild_id = ? AND user_id = ?').run(amount, guildId, fromId);
-    db.prepare('UPDATE wallets SET coins = coins + ?, total_earned = total_earned + ? WHERE guild_id = ? AND user_id = ?').run(amount, amount, guildId, toId);
-    db.prepare(`
-      INSERT INTO transactions (guild_id, from_id, to_id, amount, reason)
-      VALUES (?, ?, ?, ?, 'transfer')
-    `).run(guildId, fromId, toId, amount);
-  });
-  transfer();
-  return { ok: true };
-}
-
-/**
- * Топ богачей сервера
- */
-function getRichList(guildId, limit = 10) {
-  return db.prepare(`
-    SELECT username, coins, total_earned
-    FROM wallets
-    WHERE guild_id = ?
-    ORDER BY coins DESC
-    LIMIT ?
-  `).all(guildId, limit);
-}
-
-/**
- * Последние транзакции пользователя
- */
-function getHistory(guildId, userId, limit = 5) {
-  return db.prepare(`
-    SELECT * FROM transactions
-    WHERE guild_id = ? AND (from_id = ? OR to_id = ?)
-    ORDER BY created_at DESC
-    LIMIT ?
-  `).all(guildId, userId, userId, limit);
+function randomCatName() {
+  return CAT_NAMES[Math.floor(Math.random() * CAT_NAMES.length)];
 }
 
 module.exports = {
-  init,
-  getPet,
-  createPet,
-  updatePet,
-  getAllAlivePets,
-  recordAction,
-  getTopFeeders,
-  getCooldown,
-  setCooldown,
-  // economy
-  ensureWallet,
-  getWallet,
-  getCoins,
-  addCoins,
-  spendCoins,
-  transferCoins,
-  getRichList,
-  getHistory,
+  getMood,
+  getMoodText,
+  checkCooldown,
+  formatCooldown,
+  tickAllPets,
+  formatAge,
+  xpToNext,
+  randomCatName,
+  COOLDOWNS,
+  PRICES,
+  REWARDS,
+  TICK_MS,
 };
